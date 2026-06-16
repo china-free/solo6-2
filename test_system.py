@@ -4,9 +4,12 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
 sys.path.insert(0, str(Path(__file__).parent))
 
-from app.database import Base, engine, SessionLocal
+from app.database import Base
 from app import models, schemas
 from app.services import ReservationService, UsageService, AnomalyService, StatsService
 from app.models import (
@@ -18,17 +21,20 @@ from app.models import (
 
 
 class TestBase(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        Base.metadata.create_all(bind=engine)
-
     def setUp(self):
-        self.db = SessionLocal()
+        self.engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+        )
+        Base.metadata.create_all(bind=self.engine)
+        TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
+        self.db = TestingSessionLocal()
         self._seed_data()
 
     def tearDown(self):
-        self.db.rollback()
         self.db.close()
+        Base.metadata.drop_all(bind=self.engine)
+        self.engine.dispose()
 
     def _seed_data(self):
         self.user1 = models.User(
@@ -332,6 +338,54 @@ class TestUsageFlow(TestBase):
         )
         self.assertIsNotNone(err)
         self.assertIn("currently in use", err)
+
+    def test_unauthorized_use_without_reservation(self):
+        now = datetime.utcnow()
+        usage_service = UsageService(self.db, operator_id=self.user1.id)
+        usage, err = usage_service.check_in(
+            schemas.UsageRecordCreate(
+                instrument_id=self.instr.id,
+                user_id=self.user1.id,
+                check_in_time=now,
+            )
+        )
+        self.assertIsNone(err)
+        self.assertIsNotNone(usage)
+
+        anomalies = (
+            self.db.query(models.AnomalyRecord)
+            .filter(models.AnomalyRecord.anomaly_type == AnomalyType.UNAUTHORIZED_USE)
+            .all()
+        )
+        self.assertGreater(len(anomalies), 0)
+        self.assertEqual(anomalies[0].user_id, self.user1.id)
+        self.assertEqual(anomalies[0].instrument_id, self.instr.id)
+        self.assertEqual(anomalies[0].severity, 3)
+
+    def test_cannot_check_in_without_reservation_during_others_reservation(self):
+        now = datetime.utcnow()
+        res_service = ReservationService(self.db, operator_id=self.user1.id)
+        res, _ = res_service.create_reservation(
+            schemas.ReservationCreate(
+                instrument_id=self.instr.id,
+                user_id=self.user1.id,
+                title="他人预约",
+                start_time=now,
+                end_time=now + timedelta(hours=2),
+            )
+        )
+
+        usage_service = UsageService(self.db, operator_id=self.user2.id)
+        _, err = usage_service.check_in(
+            schemas.UsageRecordCreate(
+                instrument_id=self.instr.id,
+                user_id=self.user2.id,
+                check_in_time=now + timedelta(minutes=30),
+            )
+        )
+        self.assertIsNotNone(err)
+        self.assertIn("reserved by user", err)
+        self.assertIn("Cannot check in without reservation", err)
 
 
 class TestAnomalyService(TestBase):

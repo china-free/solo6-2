@@ -335,6 +335,29 @@ class UsageService:
                     "reservation", reservation.id, old_status, reservation.status,
                     operator_id=self.operator_id or data.user_id,
                 )
+        else:
+            grace = timedelta(minutes=instrument.grace_period_minutes or settings.DEFAULT_GRACE_PERIOD_MINUTES)
+            overlapping_reservation = self.db.query(models.Reservation).filter(
+                models.Reservation.instrument_id == data.instrument_id,
+                models.Reservation.status.in_([ReservationStatus.CONFIRMED, ReservationStatus.IN_USE]),
+                models.Reservation.start_time <= data.check_in_time + grace,
+                models.Reservation.end_time >= data.check_in_time - grace,
+            ).first()
+            if overlapping_reservation:
+                return None, (
+                    f"Cannot check in without reservation: instrument is reserved by user #{overlapping_reservation.user_id} "
+                    f"from {overlapping_reservation.start_time} to {overlapping_reservation.end_time}"
+                )
+
+            self.anomaly_service.create_anomaly(
+                schemas.AnomalyRecordCreate(
+                    anomaly_type=AnomalyType.UNAUTHORIZED_USE,
+                    instrument_id=data.instrument_id,
+                    user_id=data.user_id,
+                    description="Checked in without a valid reservation",
+                    severity=3,
+                )
+            )
 
         usage = models.UsageRecord(
             reservation_id=data.reservation_id,
