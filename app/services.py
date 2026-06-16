@@ -41,32 +41,141 @@ class ReservationService:
     ) -> bool:
         return start1 < end2 and start2 < end1
 
+    def _add_conflict(
+        self,
+        result: schemas.ReservationConflictInfo,
+        conflict_type: schemas.ConflictType,
+        message: str,
+        severity: int = 1,
+        blocked: bool = True,
+        reference_id: Optional[int] = None,
+        reference_type: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ):
+        result.has_conflict = True
+        if blocked:
+            result.has_blocking_conflict = True
+        result.conflicts.append(
+            schemas.ReservationConflictItem(
+                conflict_type=conflict_type,
+                severity=severity,
+                message=message,
+                blocked=blocked,
+                reference_id=reference_id,
+                reference_type=reference_type,
+                extra=extra,
+            )
+        )
+
     def check_conflicts(
         self,
         instrument_id: int,
         start_time: datetime,
         end_time: datetime,
         exclude_reservation_id: Optional[int] = None,
+        user_id: Optional[int] = None,
     ) -> schemas.ReservationConflictInfo:
+        result = schemas.ReservationConflictInfo(has_conflict=False)
+
+        if end_time <= start_time:
+            self._add_conflict(
+                result,
+                schemas.ConflictType.INVALID_TIME_RANGE,
+                "end_time must be after start_time",
+                severity=5,
+            )
+            result.summary = "Invalid time range"
+            return result
+
+        now = datetime.utcnow()
+        if end_time < now:
+            self._add_conflict(
+                result,
+                schemas.ConflictType.PAST_TIME_NOT_ALLOWED,
+                "Cannot create reservation for a time range that has already passed",
+                severity=4,
+            )
+            result.summary = "Reservation time is in the past"
+            return result
+
         instrument = self.db.query(models.Instrument).filter(models.Instrument.id == instrument_id).first()
         if not instrument:
-            return schemas.ReservationConflictInfo(
-                has_conflict=True, conflict_reason="Instrument not found"
+            self._add_conflict(
+                result,
+                schemas.ConflictType.INSTRUMENT_NOT_FOUND,
+                "Instrument not found",
+                severity=5,
+                reference_id=instrument_id,
+                reference_type="instrument",
             )
+            result.summary = "Instrument not found"
+            return result
 
         if instrument.status in [InstrumentStatus.OUT_OF_SERVICE, InstrumentStatus.FAULT]:
-            return schemas.ReservationConflictInfo(
-                has_conflict=True,
-                conflict_reason=f"Instrument is {instrument.status.value}, not available for reservation",
+            self._add_conflict(
+                result,
+                schemas.ConflictType.INSTRUMENT_STATUS_NOT_ALLOWED,
+                f"Instrument is {instrument.status.value}, not available for reservation",
+                severity=5,
+                reference_id=instrument.id,
+                reference_type="instrument",
+                extra={"current_status": instrument.status.value},
             )
 
         duration_hours = (end_time - start_time).total_seconds() / 3600
         max_hours = instrument.max_reservation_hours or settings.DEFAULT_MAX_RESERVATION_HOURS
         if duration_hours > max_hours:
-            return schemas.ReservationConflictInfo(
-                has_conflict=True,
-                conflict_reason=f"Reservation duration ({duration_hours:.1f}h) exceeds maximum allowed ({max_hours}h)",
+            self._add_conflict(
+                result,
+                schemas.ConflictType.DURATION_EXCEEDS_LIMIT,
+                f"Reservation duration ({duration_hours:.1f}h) exceeds maximum allowed ({max_hours}h)",
+                severity=3,
+                reference_id=instrument.id,
+                reference_type="instrument",
+                extra={
+                    "requested_hours": round(duration_hours, 2),
+                    "max_allowed_hours": max_hours,
+                },
             )
+
+        active_usage = self.db.query(models.UsageRecord).filter(
+            models.UsageRecord.instrument_id == instrument_id,
+            models.UsageRecord.check_out_time == None,
+        ).first()
+        if active_usage:
+            grace = timedelta(minutes=instrument.grace_period_minutes or settings.DEFAULT_GRACE_PERIOD_MINUTES)
+            active_expected_end = None
+            if active_usage.reservation_id:
+                active_res = self.db.query(models.Reservation).filter(
+                    models.Reservation.id == active_usage.reservation_id
+                ).first()
+                if active_res:
+                    active_expected_end = active_res.end_time + grace
+
+            overlaps_with_active = False
+            if active_expected_end and start_time < active_expected_end:
+                overlaps_with_active = True
+            elif not active_expected_end:
+                overlaps_with_active = True
+
+            if overlaps_with_active:
+                result.active_usage = schemas.UsageRecord.model_validate(active_usage)
+                self._add_conflict(
+                    result,
+                    schemas.ConflictType.ACTIVE_USAGE_OCCUPANCY,
+                    (
+                        f"Instrument is currently in use (checked in at {active_usage.check_in_time})"
+                        + (f", expected to be free by {active_expected_end}" if active_expected_end else "")
+                    ),
+                    severity=4,
+                    reference_id=active_usage.id,
+                    reference_type="usage_record",
+                    extra={
+                        "active_user_id": active_usage.user_id,
+                        "check_in_time": active_usage.check_in_time.isoformat(),
+                        "expected_free_by": active_expected_end.isoformat() if active_expected_end else None,
+                    },
+                )
 
         query = self.db.query(models.Reservation).filter(
             models.Reservation.instrument_id == instrument_id,
@@ -76,36 +185,82 @@ class ReservationService:
             query = query.filter(models.Reservation.id != exclude_reservation_id)
 
         existing_reservations = query.all()
-        conflicts = []
+        overlapping_reservations = []
         for r in existing_reservations:
             if self._time_overlaps(start_time, end_time, r.start_time, r.end_time):
-                conflicts.append(r)
-
-        if conflicts:
-            return schemas.ReservationConflictInfo(
-                has_conflict=True,
-                conflicting_reservations=[schemas.Reservation.model_validate(c) for c in conflicts],
-                conflict_reason=f"Time conflicts with {len(conflicts)} existing reservation(s)",
-            )
+                overlapping_reservations.append(r)
+                overlap_minutes = min(end_time, r.end_time) - max(start_time, r.start_time)
+                self._add_conflict(
+                    result,
+                    schemas.ConflictType.TIME_OVERLAP_WITH_RESERVATION,
+                    (
+                        f"Time overlaps with reservation #{r.id} (user #{r.user_id}): "
+                        f"{r.start_time} to {r.end_time}, overlapping for {int(overlap_minutes.total_seconds() / 60)} minutes"
+                    ),
+                    severity=4,
+                    reference_id=r.id,
+                    reference_type="reservation",
+                    extra={
+                        "reservation_id": r.id,
+                        "conflicting_user_id": r.user_id,
+                        "conflict_start": max(start_time, r.start_time).isoformat(),
+                        "conflict_end": min(end_time, r.end_time).isoformat(),
+                        "overlap_minutes": int(overlap_minutes.total_seconds() / 60),
+                    },
+                )
+        if overlapping_reservations:
+            result.conflicting_reservations = [
+                schemas.Reservation.model_validate(r) for r in overlapping_reservations
+            ]
 
         downtimes = self.db.query(models.DowntimeRecord).filter(
             models.DowntimeRecord.instrument_id == instrument_id,
             models.DowntimeRecord.is_resolved == False,
         ).all()
+        overlapping_downtimes = []
         for dt in downtimes:
             if self._time_overlaps(start_time, end_time, dt.start_time, dt.end_time):
-                return schemas.ReservationConflictInfo(
-                    has_conflict=True,
-                    conflict_reason=f"Instrument has scheduled downtime from {dt.start_time} to {dt.end_time}: {dt.reason}",
+                overlapping_downtimes.append(dt)
+                overlap_minutes = min(end_time, dt.end_time) - max(start_time, dt.start_time)
+                self._add_conflict(
+                    result,
+                    schemas.ConflictType.TIME_OVERLAP_WITH_DOWNTIME,
+                    (
+                        f"Instrument has scheduled downtime: {dt.reason} "
+                        f"({dt.start_time} to {dt.end_time}), overlapping for {int(overlap_minutes.total_seconds() / 60)} minutes"
+                    ),
+                    severity=4,
+                    reference_id=dt.id,
+                    reference_type="downtime_record",
+                    extra={
+                        "downtime_id": dt.id,
+                        "downtime_reason": dt.reason,
+                        "conflict_start": max(start_time, dt.start_time).isoformat(),
+                        "conflict_end": min(end_time, dt.end_time).isoformat(),
+                        "overlap_minutes": int(overlap_minutes.total_seconds() / 60),
+                    },
                 )
+        if overlapping_downtimes:
+            result.conflicting_downtimes = [
+                schemas.DowntimeRecord.model_validate(dt) for dt in overlapping_downtimes
+            ]
 
-        return schemas.ReservationConflictInfo(has_conflict=False)
+        if result.has_conflict:
+            blocking_count = sum(1 for c in result.conflicts if c.blocked)
+            types_summary = ", ".join(sorted(set(c.conflict_type.value for c in result.conflicts)))
+            result.summary = (
+                f"{len(result.conflicts)} conflict(s) detected ({blocking_count} blocking): {types_summary}"
+            )
+
+        return result
 
     def create_reservation(
         self, data: schemas.ReservationCreate
     ) -> Tuple[models.Reservation, Optional[schemas.ReservationConflictInfo]]:
-        conflict = self.check_conflicts(data.instrument_id, data.start_time, data.end_time)
-        if conflict.has_conflict:
+        conflict = self.check_conflicts(
+            data.instrument_id, data.start_time, data.end_time, user_id=data.user_id
+        )
+        if conflict.has_blocking_conflict:
             return None, conflict
 
         instrument = self.db.query(models.Instrument).filter(models.Instrument.id == data.instrument_id).first()
@@ -137,13 +292,26 @@ class ReservationService:
 
     def update_reservation(
         self, reservation_id: int, data: schemas.ReservationUpdate
-    ) -> Tuple[Optional[models.Reservation], Optional[str]]:
+    ) -> Tuple[Optional[models.Reservation], Optional[schemas.ReservationConflictInfo]]:
         reservation = self.db.query(models.Reservation).filter(models.Reservation.id == reservation_id).first()
         if not reservation:
-            return None, "Reservation not found"
+            err = schemas.ReservationConflictInfo(has_conflict=True, has_blocking_conflict=True, summary="Reservation not found")
+            self._add_conflict(err, schemas.ConflictType.INSTRUMENT_NOT_FOUND, "Reservation not found", severity=5)
+            return None, err
 
         if reservation.status in FINAL_STATUSES:
-            return None, f"Cannot update reservation in {reservation.status.value} status"
+            err = schemas.ReservationConflictInfo(has_conflict=True, has_blocking_conflict=True)
+            self._add_conflict(
+                err,
+                schemas.ConflictType.INSTRUMENT_STATUS_NOT_ALLOWED,
+                f"Cannot update reservation in {reservation.status.value} status",
+                severity=5,
+                reference_id=reservation.id,
+                reference_type="reservation",
+                extra={"current_status": reservation.status.value},
+            )
+            err.summary = f"Cannot update reservation with status {reservation.status.value}"
+            return None, err
 
         old_data = schemas.Reservation.model_validate(reservation).model_dump()
 
@@ -154,8 +322,8 @@ class ReservationService:
             conflict = self.check_conflicts(
                 reservation.instrument_id, new_start, new_end, exclude_reservation_id=reservation_id
             )
-            if conflict.has_conflict:
-                return None, conflict.conflict_reason
+            if conflict.has_blocking_conflict:
+                return None, conflict
 
         if data.title is not None:
             reservation.title = data.title

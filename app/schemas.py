@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional, List, Any, Dict
+from typing import Optional, List, Any, Dict, Union
 from enum import Enum
 
 from pydantic import BaseModel, Field, ConfigDict, field_validator
@@ -11,6 +11,17 @@ from .models import (
     UserRole,
     AuditAction,
 )
+
+
+class ConflictType(str, Enum):
+    INSTRUMENT_NOT_FOUND = "instrument_not_found"
+    INSTRUMENT_STATUS_NOT_ALLOWED = "instrument_status_not_allowed"
+    DURATION_EXCEEDS_LIMIT = "duration_exceeds_limit"
+    TIME_OVERLAP_WITH_RESERVATION = "time_overlap_with_reservation"
+    TIME_OVERLAP_WITH_DOWNTIME = "time_overlap_with_downtime"
+    ACTIVE_USAGE_OCCUPANCY = "active_usage_occupancy"
+    INVALID_TIME_RANGE = "invalid_time_range"
+    PAST_TIME_NOT_ALLOWED = "past_time_not_allowed"
 
 
 class UserBase(BaseModel):
@@ -222,10 +233,24 @@ class AuditLog(AuditLogBase):
     created_at: datetime
 
 
+class ReservationConflictItem(BaseModel):
+    conflict_type: ConflictType
+    severity: int = Field(1, ge=1, le=5)
+    message: str
+    blocked: bool = True
+    reference_id: Optional[int] = None
+    reference_type: Optional[str] = None
+    extra: Optional[Dict[str, Any]] = None
+
+
 class ReservationConflictInfo(BaseModel):
     has_conflict: bool
+    has_blocking_conflict: bool = False
+    conflicts: List[ReservationConflictItem] = []
     conflicting_reservations: List[Reservation] = []
-    conflict_reason: Optional[str] = None
+    conflicting_downtimes: List[DowntimeRecord] = []
+    active_usage: Optional[UsageRecord] = None
+    summary: Optional[str] = None
 
 
 class InstrumentUsageStats(BaseModel):

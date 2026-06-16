@@ -83,10 +83,10 @@ def update_reservation(
     if not existing:
         raise HTTPException(status_code=404, detail="Reservation not found")
     service = ReservationService(db, operator_id=existing.user_id)
-    reservation, error = service.update_reservation(reservation_id, data)
-    if error:
+    reservation, conflict = service.update_reservation(reservation_id, data)
+    if conflict:
         db.rollback()
-        raise HTTPException(status_code=400, detail=error)
+        raise HTTPException(status_code=409, detail=conflict.model_dump())
     db.commit()
     db.refresh(reservation)
     return reservation

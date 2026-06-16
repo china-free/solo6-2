@@ -103,10 +103,11 @@ class TestReservationConflict(TestBase):
         service = ReservationService(self.db)
         now = datetime.utcnow()
         result = service.check_conflicts(
-            self.instr.id, now, now + timedelta(hours=10)
+            self.instr.id, now + timedelta(minutes=10), now + timedelta(hours=10)
         )
         self.assertTrue(result.has_conflict)
-        self.assertIn("exceeds maximum", result.conflict_reason)
+        messages = " ".join(c.message for c in result.conflicts)
+        self.assertIn("exceeds maximum", messages)
 
     def test_downtime_conflict(self):
         now = datetime.utcnow()
@@ -125,7 +126,8 @@ class TestReservationConflict(TestBase):
             self.instr.id, now + timedelta(hours=6), now + timedelta(hours=7)
         )
         self.assertTrue(result.has_conflict)
-        self.assertIn("downtime", result.conflict_reason)
+        types_found = {c.conflict_type for c in result.conflicts}
+        self.assertIn(schemas.ConflictType.TIME_OVERLAP_WITH_DOWNTIME, types_found)
 
     def test_unavailable_instrument(self):
         self.instr.status = InstrumentStatus.OUT_OF_SERVICE
@@ -137,6 +139,144 @@ class TestReservationConflict(TestBase):
             self.instr.id, now + timedelta(hours=1), now + timedelta(hours=2)
         )
         self.assertTrue(result.has_conflict)
+
+
+class TestReservationConflictStructured(TestBase):
+    def test_conflict_detection_returns_structured_items(self):
+        now = datetime.utcnow()
+        service = ReservationService(self.db, operator_id=self.user1.id)
+        service.create_reservation(
+            schemas.ReservationCreate(
+                instrument_id=self.instr.id,
+                user_id=self.user1.id,
+                title="原预约",
+                start_time=now + timedelta(hours=1),
+                end_time=now + timedelta(hours=3),
+            )
+        )
+
+        result = service.check_conflicts(
+            self.instr.id, now + timedelta(hours=2), now + timedelta(hours=4)
+        )
+        self.assertTrue(result.has_conflict)
+        self.assertTrue(result.has_blocking_conflict)
+        self.assertGreater(len(result.conflicts), 0)
+
+        overlap_items = [
+            c for c in result.conflicts
+            if c.conflict_type == schemas.ConflictType.TIME_OVERLAP_WITH_RESERVATION
+        ]
+        self.assertGreater(len(overlap_items), 0)
+        self.assertEqual(overlap_items[0].severity, 4)
+        self.assertIsNotNone(overlap_items[0].reference_id)
+        self.assertEqual(overlap_items[0].reference_type, "reservation")
+        self.assertIn("overlap_minutes", overlap_items[0].extra)
+        self.assertIsNotNone(result.summary)
+        self.assertGreater(len(result.conflicting_reservations), 0)
+
+    def test_multiple_conflict_types_detected_simultaneously(self):
+        now = datetime.utcnow()
+        self.instr.status = InstrumentStatus.OUT_OF_SERVICE
+        downtime = models.DowntimeRecord(
+            instrument_id=self.instr.id,
+            start_time=now + timedelta(hours=1),
+            end_time=now + timedelta(hours=5),
+            reason="年度维护",
+            is_resolved=False,
+        )
+        self.db.add(downtime)
+        self.db.flush()
+
+        service = ReservationService(self.db)
+        result = service.check_conflicts(
+            self.instr.id,
+            now + timedelta(hours=2),
+            now + timedelta(hours=12),
+        )
+        self.assertTrue(result.has_conflict)
+        self.assertTrue(result.has_blocking_conflict)
+
+        types_found = {c.conflict_type for c in result.conflicts}
+        self.assertIn(schemas.ConflictType.INSTRUMENT_STATUS_NOT_ALLOWED, types_found)
+        self.assertIn(schemas.ConflictType.DURATION_EXCEEDS_LIMIT, types_found)
+        self.assertIn(schemas.ConflictType.TIME_OVERLAP_WITH_DOWNTIME, types_found)
+        self.assertGreater(len(result.conflicting_downtimes), 0)
+
+    def test_active_usage_occupancy_detected(self):
+        now = datetime.utcnow()
+        service = ReservationService(self.db, operator_id=self.user1.id)
+        res, _ = service.create_reservation(
+            schemas.ReservationCreate(
+                instrument_id=self.instr.id,
+                user_id=self.user1.id,
+                title="进行中的预约",
+                start_time=now,
+                end_time=now + timedelta(hours=2),
+            )
+        )
+        from app.services import UsageService
+        usage_svc = UsageService(self.db, operator_id=self.user1.id)
+        usage_svc.check_in(
+            schemas.UsageRecordCreate(
+                instrument_id=self.instr.id,
+                user_id=self.user1.id,
+                reservation_id=res.id,
+                check_in_time=now + timedelta(minutes=5),
+            )
+        )
+
+        conflict_result = service.check_conflicts(
+            self.instr.id,
+            now + timedelta(minutes=30),
+            now + timedelta(hours=1, minutes=30),
+        )
+        self.assertTrue(conflict_result.has_conflict)
+        active_items = [
+            c for c in conflict_result.conflicts
+            if c.conflict_type == schemas.ConflictType.ACTIVE_USAGE_OCCUPANCY
+        ]
+        self.assertGreater(len(active_items), 0)
+        self.assertIsNotNone(conflict_result.active_usage)
+
+    def test_invalid_time_range_detected(self):
+        now = datetime.utcnow()
+        service = ReservationService(self.db)
+        result = service.check_conflicts(
+            self.instr.id,
+            now + timedelta(hours=3),
+            now + timedelta(hours=1),
+        )
+        self.assertTrue(result.has_conflict)
+        types = {c.conflict_type for c in result.conflicts}
+        self.assertIn(schemas.ConflictType.INVALID_TIME_RANGE, types)
+
+    def test_past_time_range_detected(self):
+        now = datetime.utcnow()
+        service = ReservationService(self.db)
+        result = service.check_conflicts(
+            self.instr.id,
+            now - timedelta(hours=5),
+            now - timedelta(hours=3),
+        )
+        self.assertTrue(result.has_conflict)
+        types = {c.conflict_type for c in result.conflicts}
+        self.assertIn(schemas.ConflictType.PAST_TIME_NOT_ALLOWED, types)
+
+    def test_no_conflict_returns_clean_report(self):
+        now = datetime.utcnow()
+        service = ReservationService(self.db)
+        result = service.check_conflicts(
+            self.instr.id,
+            now + timedelta(hours=1),
+            now + timedelta(hours=2),
+        )
+        self.assertFalse(result.has_conflict)
+        self.assertFalse(result.has_blocking_conflict)
+        self.assertEqual(len(result.conflicts), 0)
+        self.assertEqual(len(result.conflicting_reservations), 0)
+        self.assertEqual(len(result.conflicting_downtimes), 0)
+        self.assertIsNone(result.active_usage)
+        self.assertIsNone(result.summary)
 
 
 class TestReservationFlow(TestBase):
@@ -208,17 +348,18 @@ class TestReservationFlow(TestBase):
 
     def test_auto_expire(self):
         now = datetime.utcnow()
-        service = ReservationService(self.db, operator_id=self.user1.id)
-        res, _ = service.create_reservation(
-            schemas.ReservationCreate(
-                instrument_id=self.instr.id,
-                user_id=self.user1.id,
-                title="过期预约",
-                start_time=now - timedelta(hours=5),
-                end_time=now - timedelta(hours=3),
-            )
+        res = models.Reservation(
+            instrument_id=self.instr.id,
+            user_id=self.user1.id,
+            title="过期预约",
+            start_time=now - timedelta(hours=5),
+            end_time=now - timedelta(hours=3),
+            status=ReservationStatus.CONFIRMED,
         )
+        self.db.add(res)
+        self.db.flush()
 
+        service = ReservationService(self.db)
         count = service.auto_expire_stale_reservations()
         self.assertGreaterEqual(count, 1)
         self.db.refresh(res)
@@ -299,17 +440,15 @@ class TestUsageFlow(TestBase):
 
     def test_no_show_detection(self):
         now = datetime.utcnow()
-        res_service = ReservationService(self.db, operator_id=self.user1.id)
-        res, _ = res_service.create_reservation(
-            schemas.ReservationCreate(
-                instrument_id=self.instr.id,
-                user_id=self.user1.id,
-                title="爽约测试",
-                start_time=now - timedelta(hours=2),
-                end_time=now - timedelta(hours=1),
-            )
+        res = models.Reservation(
+            instrument_id=self.instr.id,
+            user_id=self.user1.id,
+            title="爽约测试",
+            start_time=now - timedelta(hours=2),
+            end_time=now - timedelta(hours=1),
+            status=ReservationStatus.CONFIRMED,
         )
-        res.status = ReservationStatus.CONFIRMED
+        self.db.add(res)
         self.db.flush()
 
         usage_service = UsageService(self.db)
